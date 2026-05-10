@@ -6,16 +6,26 @@ from zero import ZeroServer
 from hackaton.service.app import HackatonRpcService
 from hackaton.service.config import settings
 from hackaton.service.db import init_db
+from hackaton.service.predictor import Predictor
 from hackaton.service.prepare_manager import PrepareManager
 from hackaton.service.repositories import Repository
 
 LOGGER = logging.getLogger(__name__)
+
+# Инициализация предсказателя
+predictor = Predictor(model_path="artifacts/train/model.pkl")
+try:
+    predictor.load_model()
+    LOGGER.info("Model loaded successfully from artifacts/train/model.pkl")
+except Exception as exc:
+    LOGGER.warning("Failed to load model: %s. Service will use fallback.", exc)
 
 # Use thread mode to keep shared in-memory state (prepare/ready) consistent.
 server = ZeroServer(host=settings.app_host, port=settings.app_port, use_threads=True)
 service = HackatonRpcService(
     repository=Repository(db_path=settings.db_path),
     prepare=PrepareManager(settings.prepare_sleep_seconds),
+    predictor=predictor,
 )
 
 

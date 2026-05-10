@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 from hackaton.service.app import HackatonRpcService
 from hackaton.service.db import init_db_for
+from hackaton.service.predictor import Predictor
 from hackaton.service.prepare_manager import PrepareManager
 from hackaton.service.repositories import Repository
 
@@ -16,7 +18,10 @@ def build_service(tmp_path: Path) -> HackatonRpcService:
     asyncio.run(init_db_for(db_path))
     repository = Repository(db_path=db_path)
     prepare = PrepareManager(sleep_seconds=0)
-    return HackatonRpcService(repository=repository, prepare=prepare)
+    # Mock predictor для тестов
+    predictor = MagicMock(spec=Predictor)
+    predictor.predict = AsyncMock(return_value=[])
+    return HackatonRpcService(repository=repository, prepare=prepare, predictor=predictor)
 
 
 def test_health_rpc(tmp_path: Path) -> None:

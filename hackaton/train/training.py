@@ -6,18 +6,17 @@ import pickle
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import lightgbm as lgb
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import shap
-from sklearn.compose import ColumnTransformer
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from hackaton.eval.metric import calculate_target_metric
 
 LOGGER = logging.getLogger(__name__)
+
+NEW_YEAR_HOLIDAYS = {(1, d) for d in range(1, 9)}
 
 REQUIRED_USER_COLUMNS = ["location_id", "is_strict_location", "id", "has_mk"]
 REQUIRED_SHIFT_COLUMNS = [
@@ -145,71 +144,152 @@ def _load_and_validate_data(
 def _build_training_frame(
     users: pd.DataFrame, shifts: pd.DataFrame, events: pd.DataFrame
 ) -> pd.DataFrame:
-    shifts_for_join = shifts.rename(columns={"id": "shift_id"}).copy()
-    merged_events = events.merge(
-        shifts_for_join[["shift_id", "start_at", "employer_id", "workplace_id"]],
-        on="shift_id",
-        how="inner",
-    )
-    # Prevent leakage from events after shift start.
-    merged_events = merged_events[merged_events["ts"] <= merged_events["start_at"]].copy()
+    shifts_info = shifts.rename(columns={"id": "shift_id"})[
+        ["shift_id", "start_at", "employer_id", "workplace_id", "task_type", "hours"]
+    ].copy()
+    ev = events.merge(shifts_info, on="shift_id", how="inner")
+    ev_before = ev[ev["ts"] < ev["start_at"]].copy()
 
-    grouped = merged_events.groupby(["user_id", "shift_id"], as_index=False).agg(
-        first_ts=("ts", "min"),
+    # Целевая переменная
+    target = ev[ev["interaction"].isin(["APPLY", "FINISHED"])][["user_id", "shift_id"]].drop_duplicates()
+    target["target"] = 1
+
+    # Базовые пары user-shift
+    pairs = ev_before.groupby(["user_id", "shift_id"], as_index=False).agg(
         view_cnt=("interaction", lambda s: int((s == "VIEW").sum())),
         apply_cnt=("interaction", lambda s: int((s == "APPLY").sum())),
         finished_cnt=("interaction", lambda s: int((s == "FINISHED").sum())),
         user_cancel_cnt=("interaction", lambda s: int((s == "USER_CANCEL").sum())),
-        system_cancel_cnt=("interaction", lambda s: int((s == "SYSTEM_CANCEL").sum())),
     )
-    grouped["target"] = ((grouped["apply_cnt"] + grouped["finished_cnt"]) > 0).astype(int)
+    pairs = pairs.merge(target, on=["user_id", "shift_id"], how="left")
+    pairs["target"] = pairs["target"].fillna(0).astype(int)
+    pairs = pairs.merge(shifts_info[["shift_id", "start_at"]], on="shift_id", how="left")
+    pairs = pairs.sort_values(["user_id", "start_at"]).reset_index(drop=True)
 
-    user_totals = grouped.groupby("user_id", as_index=False).agg(
-        user_total_views=("view_cnt", "sum"),
-        user_total_applies=("apply_cnt", "sum"),
-        user_total_finished=("finished_cnt", "sum"),
-    )
-    grouped = grouped.merge(user_totals, on="user_id", how="left")
-    grouped["user_hist_views"] = grouped["user_total_views"] - grouped["view_cnt"]
-    grouped["user_hist_applies"] = grouped["user_total_applies"] - grouped["apply_cnt"]
-    grouped["user_hist_finished"] = grouped["user_total_finished"] - grouped["finished_cnt"]
+    # История пользователя (cumsum без утечки будущего)
+    pairs["user_hist_views"] = pairs.groupby("user_id")["view_cnt"].cumsum() - pairs["view_cnt"]
+    pairs["user_hist_applies"] = pairs.groupby("user_id")["apply_cnt"].cumsum() - pairs["apply_cnt"]
+    pairs["user_hist_finished"] = pairs.groupby("user_id")["finished_cnt"].cumsum() - pairs["finished_cnt"]
+    pairs["user_hist_cancels"] = pairs.groupby("user_id")["user_cancel_cnt"].cumsum() - pairs["user_cancel_cnt"]
+    pairs["user_apply_rate"] = pairs["user_hist_applies"] / pairs["user_hist_views"].clip(lower=1)
+    pairs["user_finish_rate"] = pairs["user_hist_finished"] / pairs["user_hist_applies"].clip(lower=1)
+    pairs["user_cancel_rate"] = pairs["user_hist_cancels"] / pairs["user_hist_applies"].clip(lower=1)
+    pairs["cum_shifts_viewed"] = pairs.groupby("user_id").cumcount()
 
-    base = grouped.merge(shifts_for_join, on="shift_id", how="inner")
-    base = base.merge(
-        users, left_on="user_id", right_on="id", how="inner", suffixes=("_shift", "_user")
-    )
-    base["location_match"] = (base["location_id_shift"] == base["location_id_user"]).astype(int)
-    base["need_mk_match"] = (base["need_mk"] == base["has_mk"]).astype(int)
+    # Давность последней активности
+    last_active = ev_before.groupby(["user_id", "shift_id"])["ts"].max().reset_index(name="last_active_ts")
+    pairs = pairs.merge(last_active, on=["user_id", "shift_id"], how="left")
+    pairs["recency_days"] = ((pairs["start_at"] - pairs["last_active_ts"]).dt.total_seconds() / 86400).clip(lower=0)
 
-    finished = merged_events[merged_events["interaction"] == "FINISHED"][
-        ["user_id", "employer_id", "workplace_id"]
-    ].copy()
-    emp_finished = (
-        finished.groupby(["user_id", "employer_id"], as_index=False)
-        .size()
-        .rename(columns={"size": "user_finished_employer"})
+    # Усталость: работал 8+ч за последние 2 дня
+    shift_hrs = shifts.rename(columns={"id": "shift_id"})[["shift_id", "hours"]].rename(columns={"hours": "shift_hours"})
+    fin_long = ev_before[ev_before["interaction"] == "FINISHED"].merge(shift_hrs, on="shift_id", how="left")
+    fatigue = pairs[["user_id", "shift_id", "start_at"]].merge(
+        fin_long[["user_id", "shift_id", "ts", "shift_hours"]].rename(columns={"shift_id": "fin_shift", "ts": "fin_ts"}),
+        on="user_id",
+        how="left",
     )
-    wp_finished = (
-        finished.groupby(["user_id", "workplace_id"], as_index=False)
-        .size()
-        .rename(columns={"size": "user_finished_workplace"})
+    fatigue = fatigue[
+        (fatigue["fin_ts"] < fatigue["start_at"])
+        & ((fatigue["start_at"] - fatigue["fin_ts"]).dt.total_seconds() < 2 * 86400)
+        & (fatigue["shift_hours"] >= 8)
+    ][["user_id", "shift_id"]].drop_duplicates()
+    fatigue["worked_long_recently"] = 1
+    pairs = pairs.merge(fatigue, on=["user_id", "shift_id"], how="left")
+    pairs["worked_long_recently"] = pairs["worked_long_recently"].fillna(0).astype(int)
+
+    # Объединение со сменами и пользователями
+    shifts_r = shifts.rename(columns={"id": "shift_id"})
+    pairs = pairs.drop(columns=["start_at"])
+    df = pairs.merge(shifts_r, on="shift_id", how="inner")
+    df = df.merge(
+        users.rename(columns={"id": "user_id", "location_id": "user_location_id"})[
+            ["user_id", "user_location_id", "has_mk"]
+        ],
+        on="user_id",
+        how="left",
     )
-    base = base.merge(emp_finished, on=["user_id", "employer_id"], how="left")
-    base = base.merge(wp_finished, on=["user_id", "workplace_id"], how="left")
-    base["user_finished_employer"] = base["user_finished_employer"].fillna(0)
-    base["user_finished_workplace"] = base["user_finished_workplace"].fillna(0)
-    return base
+
+    df["same_location"] = (df["location_id"].astype(str) == df["user_location_id"].astype(str)).astype(int)
+    df["mk_ok"] = (df["has_mk"].astype(float) >= df["need_mk"].astype(float)).astype(int)
+
+    # Работал раньше у работодателя
+    fin_emp = ev_before[ev_before["interaction"] == "FINISHED"][["user_id", "employer_id", "start_at"]].rename(
+        columns={"start_at": "fin_at"}
+    )
+    emp_check = df[["user_id", "shift_id", "employer_id", "start_at"]].merge(fin_emp, on=["user_id", "employer_id"], how="left")
+    emp_check = emp_check[emp_check["fin_at"] < emp_check["start_at"]][["user_id", "shift_id"]].drop_duplicates()
+    emp_check["worked_employer_before"] = 1
+    df = df.merge(emp_check, on=["user_id", "shift_id"], how="left")
+    df["worked_employer_before"] = df["worked_employer_before"].fillna(0).astype(int)
+
+    # Работал раньше на точке
+    fin_wp = ev_before[ev_before["interaction"] == "FINISHED"][["user_id", "workplace_id", "start_at"]].rename(
+        columns={"start_at": "fin_at"}
+    )
+    wp_check = df[["user_id", "shift_id", "workplace_id", "start_at"]].merge(fin_wp, on=["user_id", "workplace_id"], how="left")
+    wp_check = wp_check[wp_check["fin_at"] < wp_check["start_at"]][["user_id", "shift_id"]].drop_duplicates()
+    wp_check["worked_workplace_before"] = 1
+    df = df.merge(wp_check, on=["user_id", "shift_id"], how="left")
+    df["worked_workplace_before"] = df["worked_workplace_before"].fillna(0).astype(int)
+
+    # Совпадение типа задачи с любимым
+    apply_fin_tt = ev_before[ev_before["interaction"].isin(["APPLY", "FINISHED"])][["user_id", "task_type", "start_at"]].rename(
+        columns={"start_at": "ev_start"}
+    )
+    fav_check = df[["user_id", "shift_id", "start_at", "task_type"]].merge(apply_fin_tt, on="user_id", how="left")
+    fav_check = fav_check[fav_check["ev_start"] < fav_check["start_at"]]
+    fav_cnt = fav_check.groupby(["user_id", "shift_id", "task_type_x"]).size().reset_index(name="cnt")
+    fav_task = fav_cnt.loc[fav_cnt.groupby(["user_id", "shift_id"])["cnt"].idxmax()][
+        ["user_id", "shift_id", "task_type_x"]
+    ].rename(columns={"task_type_x": "fav_task"})
+    df = df.merge(fav_task, on=["user_id", "shift_id"], how="left")
+    df["task_match"] = (df["task_type"] == df["fav_task"]).astype(int)
+
+    # CTR работодателя
+    emp_agg = ev_before.groupby("employer_id").agg(
+        emp_views=("interaction", lambda x: (x == "VIEW").sum()),
+        emp_applies=("interaction", lambda x: x.isin(["APPLY", "FINISHED"]).sum()),
+    ).reset_index()
+    emp_agg["emp_ctr"] = emp_agg["emp_applies"] / emp_agg["emp_views"].clip(lower=1)
+    df = df.merge(emp_agg[["employer_id", "emp_ctr"]], on="employer_id", how="left")
+    df["emp_ctr"] = df["emp_ctr"].fillna(0)
+
+    # Заполненность смены
+    fill = ev_before[ev_before["interaction"].isin(["APPLY", "FINISHED"])].groupby("shift_id").size().reset_index(name="n_applied")
+    df = df.merge(fill, on="shift_id", how="left")
+    df["n_applied"] = df["n_applied"].fillna(0)
+    df["fill_rate"] = (df["n_applied"] / df["capacity"].clip(lower=1)).clip(upper=5)
+
+    # Дней до смены с момента первого просмотра
+    first_view = ev_before[ev_before["interaction"] == "VIEW"].groupby(["user_id", "shift_id"])["ts"].min().reset_index(name="first_view_ts")
+    df = df.merge(first_view, on=["user_id", "shift_id"], how="left")
+    df["days_to_shift"] = ((df["start_at"] - df["first_view_ts"]).dt.total_seconds() / 86400).clip(lower=0)
+
+    # Временные признаки
+    df["reward_per_hour"] = df["reward"] / df["hours"].clip(lower=1)
+    df["weekday"] = df["start_at"].dt.dayofweek
+    df["hour"] = df["start_at"].dt.hour
+    df["is_holiday"] = df["start_at"].apply(lambda x: int((x.month, x.day) in NEW_YEAR_HOLIDAYS))
+
+    # Клиппинг выбросов
+    df["hours"] = df["hours"].clip(upper=df["hours"].quantile(0.99))
+    df["reward"] = df["reward"].clip(upper=df["reward"].quantile(0.98))
+    df["reward_per_hour"] = df["reward_per_hour"].clip(upper=500)
+    df["capacity"] = df["capacity"].clip(upper=df["capacity"].quantile(0.99))
+
+    return df
 
 
 def _time_split(frame: pd.DataFrame, test_ratio: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     if frame.empty:
         raise ValueError("Training frame is empty after preprocessing.")
-    unique_ts = np.array(sorted(frame["start_at"].dropna().unique()))
-    if unique_ts.size < 2:
-        raise ValueError("Not enough temporal points for 80/20 split.")
-    split_idx = max(1, int(unique_ts.size * (1 - test_ratio)))
-    split_idx = min(split_idx, unique_ts.size - 1)
-    split_border = unique_ts[split_idx]
+    unique_dates = np.array(sorted(frame["start_at"].dropna().dt.date.unique()))
+    if unique_dates.size < 2:
+        raise ValueError("Not enough temporal points for split.")
+    split_idx = max(1, int(unique_dates.size * (1 - test_ratio)))
+    split_idx = min(split_idx, unique_dates.size - 1)
+    split_border = pd.Timestamp(unique_dates[split_idx], tz="UTC")
     train = frame[frame["start_at"] < split_border].copy()
     test = frame[frame["start_at"] >= split_border].copy()
     if train.empty or test.empty:
@@ -217,24 +297,8 @@ def _time_split(frame: pd.DataFrame, test_ratio: float) -> tuple[pd.DataFrame, p
     return train, test
 
 
-def _build_pipeline(
-    numeric_features: list[str],
-    categorical_features: list[str],
-    random_state: int,
-    max_iter: int,
-) -> Pipeline:
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", StandardScaler(), numeric_features),
-            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
-        ]
-    )
-    model = LogisticRegression(max_iter=max_iter, random_state=random_state, solver="lbfgs")
-    return Pipeline(steps=[("preprocessor", preprocessor), ("model", model)])
-
-
 def _generate_shap_plots(
-    pipeline: Pipeline,
+    model: lgb.LGBMClassifier,
     x_train: pd.DataFrame,
     x_test: pd.DataFrame,
     output_dir: Path,
@@ -243,41 +307,25 @@ def _generate_shap_plots(
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    preprocessor = pipeline.named_steps["preprocessor"]
-    model = pipeline.named_steps["model"]
-    x_train_t = preprocessor.transform(x_train)
-    x_test_t = preprocessor.transform(x_test)
-    feature_names = preprocessor.get_feature_names_out()
+    n_test = min(sample_size, len(x_test))
+    n_train = min(sample_size, len(x_train))
+    x_test_sample = x_test.iloc[:n_test]
+    x_train_sample = x_train.iloc[:n_train]
 
-    if hasattr(x_train_t, "toarray"):
-        x_train_arr = x_train_t.toarray()
-    else:
-        x_train_arr = np.asarray(x_train_t)
-    if hasattr(x_test_t, "toarray"):
-        x_test_arr = x_test_t.toarray()
-    else:
-        x_test_arr = np.asarray(x_test_t)
-
-    n = min(sample_size, x_test_arr.shape[0])
-    x_test_sample = x_test_arr[:n]
-    x_train_sample = x_train_arr[: min(sample_size, x_train_arr.shape[0])]
-
-    explainer = shap.LinearExplainer(model, x_train_sample)
+    explainer = shap.TreeExplainer(model)
     shap_values = explainer(x_test_sample)
 
     summary_path = plots_dir / "shap_summary.png"
     bar_path = plots_dir / "shap_bar.png"
 
     plt.figure(figsize=(12, 6))
-    shap.summary_plot(shap_values.values, x_test_sample, feature_names=feature_names, show=False)
+    shap.summary_plot(shap_values, x_test_sample, show=False)
     plt.tight_layout()
     plt.savefig(summary_path, dpi=140)
     plt.close()
 
     plt.figure(figsize=(12, 6))
-    shap.summary_plot(
-        shap_values.values, x_test_sample, feature_names=feature_names, plot_type="bar", show=False
-    )
+    shap.summary_plot(shap_values, x_test_sample, plot_type="bar", show=False)
     plt.tight_layout()
     plt.savefig(bar_path, dpi=140)
     plt.close()
@@ -288,7 +336,7 @@ def _generate_shap_plots(
 def run_training(cfg: TrainConfig) -> dict[str, object]:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    LOGGER.info("Stage 1/8: Loading and validating train CSV contracts")
+    LOGGER.info("Stage 1/8: Загрузка и валидация train CSV")
     users, shifts, events, checks = _load_and_validate_data(cfg)
     LOGGER.info(
         "Loaded rows after cleanup: users=%s shifts=%s events=%s",
@@ -297,79 +345,90 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
         len(events),
     )
 
-    LOGGER.info("Stage 2/8: Building training frame and target")
+    LOGGER.info("Stage 2/8: Построение обучающего фрейма и таргета")
     frame = _build_training_frame(users, shifts, events)
     LOGGER.info("Built training frame rows=%s", len(frame))
 
-    LOGGER.info("Stage 3/8: Time split (~80/20) without leakage")
+    LOGGER.info("Stage 3/8: Временной сплит (~80/20) без утечки")
     train_frame, test_frame = _time_split(frame, cfg.test_ratio)
     LOGGER.info("Split rows: train=%s test=%s", len(train_frame), len(test_frame))
 
+    # Финальный набор признаков после ablation (30 признаков)
     feature_columns = [
-        "has_mk",
-        "is_strict_location",
-        "need_mk",
-        "id_differential",
         "hours",
         "reward",
+        "reward_per_hour",
         "capacity",
-        "location_match",
-        "need_mk_match",
+        "hour",
+        "weekday",
+        "is_holiday",
         "view_cnt",
-        "user_cancel_cnt",
-        "system_cancel_cnt",
         "user_hist_views",
         "user_hist_applies",
         "user_hist_finished",
-        "user_finished_employer",
-        "user_finished_workplace",
+        "user_hist_cancels",
+        "user_apply_rate",
+        "user_finish_rate",
+        "user_cancel_rate",
+        "cum_shifts_viewed",
+        "recency_days",
+        "worked_long_recently",
+        "same_location",
+        "mk_ok",
+        "worked_employer_before",
+        "worked_workplace_before",
+        "task_match",
+        "emp_ctr",
+        "fill_rate",
+        "days_to_shift",
+        "need_mk",
+        "id_differential",
+        "has_mk",
         "task_type",
     ]
     missing = [c for c in feature_columns if c not in frame.columns]
     if missing:
         raise ValueError(f"Missing feature columns after preprocessing: {missing}")
 
-    numeric_features = [
-        "hours",
-        "reward",
-        "capacity",
-        "location_match",
-        "need_mk_match",
-        "view_cnt",
-        "user_cancel_cnt",
-        "system_cancel_cnt",
-        "user_hist_views",
-        "user_hist_applies",
-        "user_hist_finished",
-        "user_finished_employer",
-        "user_finished_workplace",
-        "has_mk",
-        "is_strict_location",
-        "need_mk",
-        "id_differential",
-    ]
-    categorical_features = ["task_type"]
-
     x_train = train_frame[feature_columns].copy()
     x_test = test_frame[feature_columns].copy()
-    for col in ["has_mk", "is_strict_location", "need_mk", "id_differential"]:
-        x_train[col] = x_train[col].astype(int)
-        x_test[col] = x_test[col].astype(int)
-    y_train = train_frame["target"].astype(int)
 
-    LOGGER.info("Stage 4/8: Feature list and sample preview")
+    # Преобразование bool в float для LightGBM
+    for col in ["need_mk", "id_differential", "has_mk"]:
+        x_train[col] = x_train[col].astype(float)
+        x_test[col] = x_test[col].astype(float)
+
+    # task_type как категория
+    x_train["task_type"] = x_train["task_type"].astype("category")
+    x_test["task_type"] = x_test["task_type"].astype("category")
+
+    y_train = train_frame["target"].astype(int)
+    y_test = test_frame["target"].astype(int)
+
+    LOGGER.info("Stage 4/8: Список признаков и превью")
     LOGGER.info("Feature columns: %s", ", ".join(feature_columns))
     LOGGER.info("Feature sample:\n%s", x_train.head(5).to_string(index=False))
 
-    # """ EXTENSION POINT: swap baseline model/pipeline while keeping artifact contract stable. """
-    LOGGER.info("Stage 5/8: Fitting LogisticRegression baseline")
-    pipeline = _build_pipeline(
-        numeric_features, categorical_features, cfg.random_state, cfg.max_iter
+    LOGGER.info("Stage 5/8: Обучение LightGBM с early stopping")
+    model = lgb.LGBMClassifier(
+        n_estimators=2000,
+        learning_rate=0.05,
+        num_leaves=63,
+        scale_pos_weight=7,
+        random_state=cfg.random_state,
+        n_jobs=-1,
+        verbose=-1,
     )
-    pipeline.fit(x_train, y_train)
+    model.fit(
+        x_train,
+        y_train,
+        eval_set=[(x_test, y_test)],
+        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(100)],
+    )
+    LOGGER.info("Best iteration: %s", model.best_iteration_)
 
-    LOGGER.info("Stage 6/8: Running inference and calculating target metric")
-    proba = pipeline.predict_proba(x_test)[:, 1]
+    LOGGER.info("Stage 6/8: Инференс и расчёт целевой метрики")
+    proba = model.predict_proba(x_test)[:, 1]
     metric_df = test_frame[["shift_id", "start_at", "capacity", "target"]].copy()
     metric_df["score"] = proba
     metric_result = calculate_target_metric(metric_df)
@@ -381,11 +440,12 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
         "day_metrics": metric_result.day_metrics,
         "test_rows": int(len(test_frame)),
         "train_rows": int(len(train_frame)),
+        "best_iteration": int(model.best_iteration_) if model.best_iteration_ else 0,
     }
 
-    LOGGER.info("Stage 7/8: Saving model and artifacts to %s", output_dir)
+    LOGGER.info("Stage 7/8: Сохранение модели и артефактов в %s", output_dir)
     with (output_dir / "model.pkl").open("wb") as f:
-        pickle.dump(pipeline, f)
+        pickle.dump(model, f)
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -393,8 +453,6 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
         json.dumps(
             {
                 "feature_columns": feature_columns,
-                "numeric_features": numeric_features,
-                "categorical_features": categorical_features,
                 "examples": x_train.head(5).to_dict(orient="records"),
             },
             ensure_ascii=False,
@@ -424,6 +482,7 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
         f"- evaluated_days: {metrics['evaluated_days']}",
         f"- evaluated_groups: {metrics['evaluated_groups']}",
         f"- evaluated_shifts: {metrics['evaluated_shifts']}",
+        f"- best_iteration: {metrics['best_iteration']}",
     ]
 
     shap_result: dict[str, str] = {}
@@ -431,9 +490,7 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
         report_lines.extend(["", "## SHAP", "", "- SHAP skipped by config (--skip-shap)."])
     else:
         try:
-            shap_result = _generate_shap_plots(
-                pipeline, x_train, x_test, output_dir, cfg.shap_sample_size
-            )
+            shap_result = _generate_shap_plots(model, x_train, x_test, output_dir, cfg.shap_sample_size)
             report_lines.extend(
                 [
                     "",

@@ -12,6 +12,7 @@ from hackaton.service.dto import (
     PredictRequest,
     PredictResponse,
 )
+from hackaton.service.predictor import Predictor
 from hackaton.service.prepare_manager import PrepareManager
 from hackaton.service.repositories import Repository
 
@@ -21,9 +22,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 class HackatonRpcService:
-    def __init__(self, repository: Repository, prepare: PrepareManager) -> None:
+    def __init__(self, repository: Repository, prepare: PrepareManager, predictor: Predictor) -> None:
         self.repository = repository
         self.prepare_manager = prepare
+        self.predictor = predictor
 
     async def user(self, payload: dict) -> dict:
         REQUEST_COUNT.labels("user").inc()
@@ -95,20 +97,33 @@ class HackatonRpcService:
             except ValidationError as exc:
                 return {"user_ids": [], "status_code": 422, "detail": str(exc)}
 
-            """
-                EXTENSION POINT
-                Ваше решение должно быть здесь.
-            """
+            # Получаем пул кандидатов (фильтр по локации и МК)
             candidates = await self.repository.find_top_candidates(
                 location_id=request.shift.location_id,
                 need_mk=request.shift.need_mk,
-                limit=request.limit,
+                limit=100,  # Берём больше для ранжирования
             )
             if not candidates:
-                candidates = await self.repository.fallback_candidates(limit=request.limit)
+                candidates = await self.repository.fallback_candidates(limit=100)
             if not candidates:
                 return {"user_ids": [], "status_code": 400, "detail": "no users loaded"}
-            result = PredictResponse(user_ids=candidates)
+
+            # Ранжирование через модель
+            try:
+                ranked_ids = await self.predictor.predict(
+                    shift=request.shift,
+                    candidate_ids=candidates,
+                    db_path=self.repository.db_path,
+                    limit=request.limit,
+                )
+                if not ranked_ids:
+                    # Fallback на простой фильтр если модель не вернула результатов
+                    ranked_ids = candidates[: request.limit]
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("Predictor failed: %s, falling back to simple filter", exc)
+                ranked_ids = candidates[: request.limit]
+
+            result = PredictResponse(user_ids=ranked_ids)
             return {"user_ids": result.user_ids, "status_code": 200}
 
     async def health(self, _: dict | None = None) -> dict:
