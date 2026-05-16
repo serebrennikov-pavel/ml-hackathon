@@ -37,6 +37,7 @@ class Predictor:
             "worked_long_recently",
             "same_location",
             "mk_ok",
+            "is_strict_location",
             "worked_employer_before",
             "worked_workplace_before",
             "task_match",
@@ -68,13 +69,15 @@ class Predictor:
         async with aiosqlite.connect(db_path) as db:
             # Получаем данные пользователей
             user_query = f"""
-            SELECT id, location_id, has_mk
+            SELECT id, location_id, has_mk, is_strict_location
             FROM users
             WHERE id IN ({','.join('?' * len(candidate_ids))})
             """
             cursor = await db.execute(user_query, candidate_ids)
             user_rows = await cursor.fetchall()
-            users_df = pd.DataFrame(user_rows, columns=["user_id", "user_location_id", "has_mk"])
+            users_df = pd.DataFrame(
+                user_rows, columns=["user_id", "user_location_id", "has_mk", "is_strict_location"]
+            )
 
             # Получаем события до start_at смены
             event_query = """
@@ -216,6 +219,7 @@ class Predictor:
             # Совпадения
             same_location = int(shift.location_id == user_data["user_location_id"])
             mk_ok = int(user_data["has_mk"] >= shift.need_mk)
+            is_strict_location = float(user_data["is_strict_location"])
             worked_employer_before = int(user_id in worked_emp)
             worked_workplace_before = int(user_id in worked_wp)
             task_match = int(fav_tasks_dict.get(user_id) == shift.task_type)
@@ -251,6 +255,7 @@ class Predictor:
                     "worked_long_recently": worked_long_recently,
                     "same_location": same_location,
                     "mk_ok": mk_ok,
+                    "is_strict_location": is_strict_location,
                     "worked_employer_before": worked_employer_before,
                     "worked_workplace_before": worked_workplace_before,
                     "task_match": task_match,

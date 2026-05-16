@@ -6,11 +6,10 @@ import pickle
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import lightgbm as lgb
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import shap
+from catboost import CatBoostClassifier, Pool
 
 from hackaton.eval.metric import calculate_target_metric
 
@@ -35,6 +34,45 @@ REQUIRED_SHIFT_COLUMNS = [
 REQUIRED_EVENT_COLUMNS = ["id", "shift_id", "user_id", "interaction", "ts"]
 VALID_INTERACTIONS = {"VIEW", "APPLY", "FINISHED", "USER_CANCEL", "SYSTEM_CANCEL"}
 
+# Финальный набор признаков (31 шт) — итог раздела "Финальный набор" в EDA-ноутбуке.
+# Убраны month, is_weekend, day_of_month (ablation: переобучение из-за непересечения
+# train/test по конкретным датам). Добавлен is_strict_location (требование заказчика).
+FEATURE_COLUMNS = [
+    "hours",
+    "reward",
+    "reward_per_hour",
+    "capacity",
+    "hour",
+    "weekday",
+    "is_holiday",
+    "view_cnt",
+    "user_hist_views",
+    "user_hist_applies",
+    "user_hist_finished",
+    "user_hist_cancels",
+    "user_apply_rate",
+    "user_finish_rate",
+    "user_cancel_rate",
+    "cum_shifts_viewed",
+    "recency_days",
+    "worked_long_recently",
+    "same_location",
+    "mk_ok",
+    "is_strict_location",
+    "worked_employer_before",
+    "worked_workplace_before",
+    "task_match",
+    "emp_ctr",
+    "fill_rate",
+    "days_to_shift",
+    "need_mk",
+    "id_differential",
+    "has_mk",
+    "task_type",
+]
+CATEGORICAL_FEATURES = ["task_type"]
+BOOL_AS_FLOAT_FEATURES = ["need_mk", "id_differential", "has_mk", "is_strict_location"]
+
 
 @dataclass(frozen=True, slots=True)
 class TrainConfig:
@@ -43,7 +81,6 @@ class TrainConfig:
     event_path: str
     output_dir: str
     random_state: int = 42
-    max_iter: int = 1000
     test_ratio: float = 0.2
     skip_shap: bool = False
     shap_sample_size: int = 1000
@@ -150,11 +187,11 @@ def _build_training_frame(
     ev = events.merge(shifts_info, on="shift_id", how="inner")
     ev_before = ev[ev["ts"] < ev["start_at"]].copy()
 
-    # Целевая переменная
+    # Целевая переменная: из ВСЕХ событий (включая поздние APPLY/FINISHED после start_at)
     target = ev[ev["interaction"].isin(["APPLY", "FINISHED"])][["user_id", "shift_id"]].drop_duplicates()
     target["target"] = 1
 
-    # Базовые пары user-shift
+    # Базовые пары user-shift из событий ДО start_at (защита от утечки)
     pairs = ev_before.groupby(["user_id", "shift_id"], as_index=False).agg(
         view_cnt=("interaction", lambda s: int((s == "VIEW").sum())),
         apply_cnt=("interaction", lambda s: int((s == "APPLY").sum())),
@@ -198,13 +235,13 @@ def _build_training_frame(
     pairs = pairs.merge(fatigue, on=["user_id", "shift_id"], how="left")
     pairs["worked_long_recently"] = pairs["worked_long_recently"].fillna(0).astype(int)
 
-    # Объединение со сменами и пользователями
+    # Объединение со сменами и пользователями (is_strict_location — обязательный по спецификации)
     shifts_r = shifts.rename(columns={"id": "shift_id"})
     pairs = pairs.drop(columns=["start_at"])
     df = pairs.merge(shifts_r, on="shift_id", how="inner")
     df = df.merge(
         users.rename(columns={"id": "user_id", "location_id": "user_location_id"})[
-            ["user_id", "user_location_id", "has_mk"]
+            ["user_id", "user_location_id", "has_mk", "is_strict_location"]
         ],
         on="user_id",
         how="left",
@@ -212,6 +249,7 @@ def _build_training_frame(
 
     df["same_location"] = (df["location_id"].astype(str) == df["user_location_id"].astype(str)).astype(int)
     df["mk_ok"] = (df["has_mk"].astype(float) >= df["need_mk"].astype(float)).astype(int)
+    df["is_strict_location"] = df["is_strict_location"].astype(float)
 
     # Работал раньше у работодателя
     fin_emp = ev_before[ev_before["interaction"] == "FINISHED"][["user_id", "employer_id", "start_at"]].rename(
@@ -266,7 +304,7 @@ def _build_training_frame(
     df = df.merge(first_view, on=["user_id", "shift_id"], how="left")
     df["days_to_shift"] = ((df["start_at"] - df["first_view_ts"]).dt.total_seconds() / 86400).clip(lower=0)
 
-    # Временные признаки
+    # Временные признаки (month, is_weekend, day_of_month убраны после ablation)
     df["reward_per_hour"] = df["reward"] / df["hours"].clip(lower=1)
     df["weekday"] = df["start_at"].dt.dayofweek
     df["hour"] = df["start_at"].dt.hour
@@ -297,40 +335,37 @@ def _time_split(frame: pd.DataFrame, test_ratio: float) -> tuple[pd.DataFrame, p
     return train, test
 
 
-def _generate_shap_plots(
-    model: lgb.LGBMClassifier,
-    x_train: pd.DataFrame,
-    x_test: pd.DataFrame,
-    output_dir: Path,
-    sample_size: int,
+def _prepare_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Приводит фрейм к виду, ожидаемому CatBoost."""
+    x = frame[FEATURE_COLUMNS].copy()
+    for col in BOOL_AS_FLOAT_FEATURES:
+        x[col] = x[col].astype(float)
+    for col in CATEGORICAL_FEATURES:
+        x[col] = x[col].astype(str)
+    return x
+
+
+def _generate_importance_plot(
+    model: CatBoostClassifier, output_dir: Path
 ) -> dict[str, str]:
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    n_test = min(sample_size, len(x_test))
-    n_train = min(sample_size, len(x_train))
-    x_test_sample = x_test.iloc[:n_test]
-    x_train_sample = x_train.iloc[:n_train]
+    importance = pd.Series(model.feature_importances_, index=FEATURE_COLUMNS).sort_values(ascending=True)
+    importance_top = importance.tail(20)
 
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer(x_test_sample)
-
-    summary_path = plots_dir / "shap_summary.png"
-    bar_path = plots_dir / "shap_bar.png"
-
-    plt.figure(figsize=(12, 6))
-    shap.summary_plot(shap_values, x_test_sample, show=False)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.barh(range(len(importance_top)), importance_top.values, color="#4878CF")
+    ax.set_yticks(range(len(importance_top)))
+    ax.set_yticklabels(importance_top.index)
+    ax.set_title("CatBoost feature importance (top-20)")
+    ax.set_xlabel("importance")
     plt.tight_layout()
-    plt.savefig(summary_path, dpi=140)
-    plt.close()
 
-    plt.figure(figsize=(12, 6))
-    shap.summary_plot(shap_values, x_test_sample, plot_type="bar", show=False)
-    plt.tight_layout()
-    plt.savefig(bar_path, dpi=140)
+    path = plots_dir / "feature_importance.png"
+    plt.savefig(path, dpi=140)
     plt.close()
-
-    return {"shap_summary": str(summary_path), "shap_bar": str(bar_path)}
+    return {"feature_importance": str(path)}
 
 
 def run_training(cfg: TrainConfig) -> dict[str, object]:
@@ -353,82 +388,39 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
     train_frame, test_frame = _time_split(frame, cfg.test_ratio)
     LOGGER.info("Split rows: train=%s test=%s", len(train_frame), len(test_frame))
 
-    # Финальный набор признаков после ablation (30 признаков)
-    feature_columns = [
-        "hours",
-        "reward",
-        "reward_per_hour",
-        "capacity",
-        "hour",
-        "weekday",
-        "is_holiday",
-        "view_cnt",
-        "user_hist_views",
-        "user_hist_applies",
-        "user_hist_finished",
-        "user_hist_cancels",
-        "user_apply_rate",
-        "user_finish_rate",
-        "user_cancel_rate",
-        "cum_shifts_viewed",
-        "recency_days",
-        "worked_long_recently",
-        "same_location",
-        "mk_ok",
-        "worked_employer_before",
-        "worked_workplace_before",
-        "task_match",
-        "emp_ctr",
-        "fill_rate",
-        "days_to_shift",
-        "need_mk",
-        "id_differential",
-        "has_mk",
-        "task_type",
-    ]
-    missing = [c for c in feature_columns if c not in frame.columns]
+    missing = [c for c in FEATURE_COLUMNS if c not in frame.columns]
     if missing:
         raise ValueError(f"Missing feature columns after preprocessing: {missing}")
 
-    x_train = train_frame[feature_columns].copy()
-    x_test = test_frame[feature_columns].copy()
-
-    # Преобразование bool в float для LightGBM
-    for col in ["need_mk", "id_differential", "has_mk"]:
-        x_train[col] = x_train[col].astype(float)
-        x_test[col] = x_test[col].astype(float)
-
-    # task_type как категория
-    x_train["task_type"] = x_train["task_type"].astype("category")
-    x_test["task_type"] = x_test["task_type"].astype("category")
+    x_train = _prepare_features(train_frame)
+    x_test = _prepare_features(test_frame)
 
     y_train = train_frame["target"].astype(int)
     y_test = test_frame["target"].astype(int)
 
     LOGGER.info("Stage 4/8: Список признаков и превью")
-    LOGGER.info("Feature columns: %s", ", ".join(feature_columns))
+    LOGGER.info("Feature columns: %s", ", ".join(FEATURE_COLUMNS))
     LOGGER.info("Feature sample:\n%s", x_train.head(5).to_string(index=False))
 
-    LOGGER.info("Stage 5/8: Обучение LightGBM с early stopping")
-    model = lgb.LGBMClassifier(
-        n_estimators=2000,
+    LOGGER.info("Stage 5/8: Обучение CatBoost с early stopping")
+    pool_train = Pool(x_train, y_train, cat_features=CATEGORICAL_FEATURES)
+    pool_test = Pool(x_test, y_test, cat_features=CATEGORICAL_FEATURES)
+
+    model = CatBoostClassifier(
+        iterations=2000,
         learning_rate=0.05,
-        num_leaves=63,
+        depth=6,
         scale_pos_weight=7,
-        random_state=cfg.random_state,
-        n_jobs=-1,
-        verbose=-1,
+        random_seed=cfg.random_state,
+        thread_count=-1,
+        early_stopping_rounds=50,
+        verbose=100,
     )
-    model.fit(
-        x_train,
-        y_train,
-        eval_set=[(x_test, y_test)],
-        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(100)],
-    )
+    model.fit(pool_train, eval_set=pool_test)
     LOGGER.info("Best iteration: %s", model.best_iteration_)
 
     LOGGER.info("Stage 6/8: Инференс и расчёт целевой метрики")
-    proba = model.predict_proba(x_test)[:, 1]
+    proba = model.predict_proba(pool_test)[:, 1]
     metric_df = test_frame[["shift_id", "start_at", "capacity", "target"]].copy()
     metric_df["score"] = proba
     metric_result = calculate_target_metric(metric_df)
@@ -452,7 +444,9 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
     (output_dir / "feature_schema.json").write_text(
         json.dumps(
             {
-                "feature_columns": feature_columns,
+                "feature_columns": FEATURE_COLUMNS,
+                "categorical_features": CATEGORICAL_FEATURES,
+                "bool_as_float_features": BOOL_AS_FLOAT_FEATURES,
                 "examples": x_train.head(5).to_dict(orient="records"),
             },
             ensure_ascii=False,
@@ -471,6 +465,11 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
     report_lines = [
         "# Train Report",
         "",
+        "## Model",
+        "",
+        "- algorithm: CatBoostClassifier",
+        f"- features: {len(FEATURE_COLUMNS)} (final set after ablation)",
+        "",
         "## Data",
         "",
         f"- train_rows: {len(train_frame):,}",
@@ -485,27 +484,26 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
         f"- best_iteration: {metrics['best_iteration']}",
     ]
 
-    shap_result: dict[str, str] = {}
+    importance_result: dict[str, str] = {}
     if cfg.skip_shap:
-        report_lines.extend(["", "## SHAP", "", "- SHAP skipped by config (--skip-shap)."])
+        report_lines.extend(["", "## Feature importance", "", "- skipped by config (--skip-shap)."])
     else:
         try:
-            shap_result = _generate_shap_plots(model, x_train, x_test, output_dir, cfg.shap_sample_size)
+            importance_result = _generate_importance_plot(model, output_dir)
             report_lines.extend(
                 [
                     "",
-                    "## SHAP",
+                    "## Feature importance",
                     "",
-                    f"- shap_summary: {shap_result['shap_summary']}",
-                    f"- shap_bar: {shap_result['shap_bar']}",
+                    f"- plot: {importance_result['feature_importance']}",
                 ]
             )
         except Exception as exc:  # noqa: BLE001
-            skip_path = output_dir / "plots" / "shap_skipped.txt"
+            skip_path = output_dir / "plots" / "importance_skipped.txt"
             skip_path.parent.mkdir(parents=True, exist_ok=True)
-            skip_path.write_text(f"SHAP generation failed: {exc}", encoding="utf-8")
-            report_lines.extend(["", "## SHAP", "", f"- SHAP generation failed: {exc}"])
+            skip_path.write_text(f"Importance plot failed: {exc}", encoding="utf-8")
+            report_lines.extend(["", "## Feature importance", "", f"- failed: {exc}"])
 
     (output_dir / "train_report.md").write_text("\n".join(report_lines), encoding="utf-8")
     LOGGER.info("Stage 8/8: Training pipeline finished successfully")
-    return {"metrics": metrics, "shap": shap_result}
+    return {"metrics": metrics, "plots": importance_result}
