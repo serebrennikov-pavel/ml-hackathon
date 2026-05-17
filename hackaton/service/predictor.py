@@ -48,6 +48,13 @@ class Predictor:
             "id_differential",
             "has_mk",
             "task_type",
+            # Новые признаки v2
+            "user_reliability_score",
+            "system_cancel_cnt",
+            "user_finished_employer",
+            "user_finished_workplace",
+            "user_task_affinity",
+            "reward_delta",
         ]
 
     def load_model(self) -> None:
@@ -176,6 +183,97 @@ class Predictor:
             fill_row = await cursor.fetchone()
             n_applied = fill_row[0] if fill_row else 0
 
+            # === НОВЫЕ ПРИЗНАКИ V2 ===
+
+            # Количество системных отмен для каждого пользователя
+            sys_cancel_query = """
+            SELECT user_id, COUNT(*) as cnt
+            FROM events
+            WHERE user_id IN ({})
+              AND shift_id = ?
+              AND interaction = 'SYSTEM_CANCEL'
+              AND ts < ?
+            GROUP BY user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(
+                sys_cancel_query, [*candidate_ids, shift.id, shift.start_at.isoformat()]
+            )
+            sys_cancel_rows = await cursor.fetchall()
+            sys_cancel_dict = {row[0]: row[1] for row in sys_cancel_rows}
+
+            # Количество завершенных смен у работодателя
+            fin_emp_query = """
+            SELECT e.user_id, COUNT(*) as cnt
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction = 'FINISHED'
+              AND s.employer_id = ?
+              AND s.start_at < ?
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(
+                fin_emp_query, [*candidate_ids, shift.employer_id, shift.start_at.isoformat()]
+            )
+            fin_emp_rows = await cursor.fetchall()
+            fin_emp_dict = {row[0]: row[1] for row in fin_emp_rows}
+
+            # Количество завершенных смен на точке
+            fin_wp_query = """
+            SELECT e.user_id, COUNT(*) as cnt
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction = 'FINISHED'
+              AND s.workplace_id = ?
+              AND s.start_at < ?
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(
+                fin_wp_query, [*candidate_ids, shift.workplace_id, shift.start_at.isoformat()]
+            )
+            fin_wp_rows = await cursor.fetchall()
+            fin_wp_dict = {row[0]: row[1] for row in fin_wp_rows}
+
+            # Аффинити к типу задачи
+            task_affinity_query = """
+            SELECT e.user_id, COUNT(*) as cnt
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction IN ('APPLY', 'FINISHED')
+              AND s.task_type = ?
+              AND s.start_at < ?
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(
+                task_affinity_query, [*candidate_ids, shift.task_type, shift.start_at.isoformat()]
+            )
+            task_affinity_rows = await cursor.fetchall()
+            task_affinity_dict = {row[0]: row[1] for row in task_affinity_rows}
+
+            # Средняя награда пользователя
+            avg_reward_query = """
+            SELECT e.user_id, AVG(s.reward) as avg_reward
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction IN ('APPLY', 'FINISHED')
+              AND s.start_at < ?
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(avg_reward_query, [*candidate_ids, shift.start_at.isoformat()])
+            avg_reward_rows = await cursor.fetchall()
+            avg_reward_dict = {row[0]: row[1] for row in avg_reward_rows}
+
+            # Веса для user_reliability_score
+            INTERACTION_WEIGHTS = {
+                "FINISHED": 2.0,
+                "APPLY": 1.0,
+                "USER_CANCEL": -1.5,
+                "SYSTEM_CANCEL": -0.5,
+            }
+
         # Построение фрейма признаков
         features = []
         for user_id in candidate_ids:
@@ -232,6 +330,33 @@ class Predictor:
 
             fill_rate = min(n_applied / max(shift.capacity, 1), 5)
 
+            # === НОВЫЕ ПРИЗНАКИ V2 ===
+
+            # 1. system_cancel_cnt
+            system_cancel_cnt = sys_cancel_dict.get(user_id, 0)
+
+            # 2. user_reliability_score
+            user_hist_system_cancels = int((user_hist["interaction"] == "SYSTEM_CANCEL").sum())
+            user_reliability_score = (
+                user_hist_finished * INTERACTION_WEIGHTS["FINISHED"]
+                + user_hist_applies * INTERACTION_WEIGHTS["APPLY"]
+                + user_hist_cancels * INTERACTION_WEIGHTS["USER_CANCEL"]
+                + user_hist_system_cancels * INTERACTION_WEIGHTS["SYSTEM_CANCEL"]
+            )
+
+            # 3. user_finished_employer
+            user_finished_employer = fin_emp_dict.get(user_id, 0)
+
+            # 4. user_finished_workplace
+            user_finished_workplace = fin_wp_dict.get(user_id, 0)
+
+            # 5. user_task_affinity
+            user_task_affinity = task_affinity_dict.get(user_id, 0)
+
+            # 6. reward_delta
+            user_avg_reward = avg_reward_dict.get(user_id, shift.reward)
+            reward_delta = shift.reward - user_avg_reward
+
             features.append(
                 {
                     "user_id": user_id,
@@ -266,6 +391,13 @@ class Predictor:
                     "id_differential": float(shift.id_differential),
                     "has_mk": float(user_data["has_mk"]),
                     "task_type": shift.task_type,
+                    # Новые признаки v2
+                    "user_reliability_score": user_reliability_score,
+                    "system_cancel_cnt": system_cancel_cnt,
+                    "user_finished_employer": user_finished_employer,
+                    "user_finished_workplace": user_finished_workplace,
+                    "user_task_affinity": user_task_affinity,
+                    "reward_delta": reward_delta,
                 }
             )
 

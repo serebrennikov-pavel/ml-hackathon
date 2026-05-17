@@ -46,11 +46,12 @@ pool_size = 10 (топ-10 кандидатов на смену)
 
 ### Текущие результаты
 
-| Метрика | Baseline (LogisticRegression) | Текущее решение (CatBoost) |
-|---------|-------------------------------|------------------------------|
-| Target metric | 0.78 | 0.987 |
-| Признаков | 18 | 31 |
+| Метрика | Baseline (LogisticRegression) | Текущее решение (CatBoost v2) |
+|---------|-------------------------------|--------------------------------|
+| Target metric | 0.78 | 0.91 (ожидается) |
+| Признаков | 18 | 37 |
 | Модель | LogisticRegression | CatBoostClassifier |
+| Scale pos weight | - | 19 (дисбаланс 20:1) |
 
 ---
 
@@ -217,7 +218,7 @@ poetry run python -m hackaton.train.cli train \
 **Stage 2/8:** Построение обучающего фрейма
 - Создание пар user-shift
 - Извлечение целевой переменной (APPLY/FINISHED)
-- Feature engineering (31 признак)
+- Feature engineering (37 признаков)
 
 **Stage 3/8:** Временной сплит (80/20)
 - Разделение по датам (без утечки будущего)
@@ -225,13 +226,13 @@ poetry run python -m hackaton.train.cli train \
 - Test: более поздние даты
 
 **Stage 4/8:** Список признаков и превью
-- Вывод всех 31 признака
+- Вывод всех 37 признаков
 - Примеры значений
 
 **Stage 5/8:** Обучение CatBoost
 - 2000 итераций максимум
 - Early stopping (50 итераций без улучшения)
-- Scale pos weight = 7 (компенсация дисбаланса 1:7)
+- Scale pos weight = 19 (компенсация дисбаланса 20:1)
 
 **Stage 6/8:** Инференс и расчет метрики
 - Предсказание на test выборке
@@ -260,7 +261,7 @@ artifacts/train/
 └── data_contract_check.json  # Результаты валидации данных
 ```
 
-### Признаки модели (31 шт)
+### Признаки модели (37 шт)
 
 **Характеристики смены (4):**
 - `hours` — длительность смены
@@ -307,6 +308,14 @@ artifacts/train/
 - `has_mk` — есть медкнижка
 - `task_type` — тип задачи (категориальный)
 
+**Новые признаки v2 (6):**
+- `user_reliability_score` — взвешенный балл надежности (FINISHED×2 + APPLY×1 - USER_CANCEL×1.5 - SYSTEM_CANCEL×0.5)
+- `system_cancel_cnt` — количество системных отмен
+- `user_finished_employer` — количество завершенных смен у работодателя
+- `user_finished_workplace` — количество завершенных смен на точке
+- `user_task_affinity` — аффинити к типу задачи (количество APPLY/FINISHED)
+- `reward_delta` — отклонение вознаграждения от среднего пользователя
+
 ---
 
 ## Запуск сервиса
@@ -342,19 +351,6 @@ Starting service: host=0.0.0.0 port=8000
 Database initialized successfully
 Starting server at tcp://0.0.0.0:8000
 Starting worker 1...16
-```
-
-### Проверка работы
-
-```bash
-# Простая проверка
-poetry run python check_service.py
-
-# Вывод:
-# Health: {'status': 'ok', 'status_code': 200}
-# Users count: {'count': 0}
-# Shifts count: {'count': 0}
-# Events count: {'count': 0}
 ```
 
 ### Остановка сервиса
@@ -739,7 +735,7 @@ def calculate_target_metric(frame):
 | 0.7 | Приемлемое качество |
 | 0.8 | Хорошее качество |
 | 0.9+ | Отличное качество |
-| 0.987 | Текущий результат |
+| 0.91 | Ожидаемый результат (v2 с 37 признаками) |
 
 ---
 

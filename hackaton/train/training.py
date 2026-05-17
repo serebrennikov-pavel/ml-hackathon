@@ -34,9 +34,9 @@ REQUIRED_SHIFT_COLUMNS = [
 REQUIRED_EVENT_COLUMNS = ["id", "shift_id", "user_id", "interaction", "ts"]
 VALID_INTERACTIONS = {"VIEW", "APPLY", "FINISHED", "USER_CANCEL", "SYSTEM_CANCEL"}
 
-# Финальный набор признаков (31 шт) — итог раздела "Финальный набор" в EDA-ноутбуке.
-# Убраны month, is_weekend, day_of_month (ablation: переобучение из-за непересечения
-# train/test по конкретным датам). Добавлен is_strict_location (требование заказчика).
+# Финальный набор признаков (37 шт) — v2 из EDA-ноутбука.
+# Базовые 31 признак после ablation (убраны month, is_weekend, day_of_month).
+# Добавлено 6 новых признаков v2 для улучшения качества модели.
 FEATURE_COLUMNS = [
     "hours",
     "reward",
@@ -69,6 +69,13 @@ FEATURE_COLUMNS = [
     "id_differential",
     "has_mk",
     "task_type",
+    # Новые признаки v2
+    "user_reliability_score",
+    "system_cancel_cnt",
+    "user_finished_employer",
+    "user_finished_workplace",
+    "user_task_affinity",
+    "reward_delta",
 ]
 CATEGORICAL_FEATURES = ["task_type"]
 BOOL_AS_FLOAT_FEATURES = ["need_mk", "id_differential", "has_mk", "is_strict_location"]
@@ -316,6 +323,89 @@ def _build_training_frame(
     df["reward_per_hour"] = df["reward_per_hour"].clip(upper=500)
     df["capacity"] = df["capacity"].clip(upper=df["capacity"].quantile(0.99))
 
+    # === НОВЫЕ ПРИЗНАКИ V2 ===
+
+    # 1. system_cancel_cnt - количество системных отмен
+    sys_cnt = (
+        ev_before[ev_before["interaction"] == "SYSTEM_CANCEL"]
+        .groupby(["user_id", "shift_id"])
+        .size()
+        .reset_index(name="system_cancel_cnt")
+    )
+    df = df.merge(sys_cnt, on=["user_id", "shift_id"], how="left")
+    df["system_cancel_cnt"] = df["system_cancel_cnt"].fillna(0).astype(int)
+
+    # 2. user_reliability_score - взвешенный балл надежности
+    INTERACTION_WEIGHTS = {"FINISHED": 2.0, "APPLY": 1.0, "USER_CANCEL": -1.5, "SYSTEM_CANCEL": -0.5}
+
+    pairs_hist = ev_before.groupby(["user_id", "shift_id"], as_index=False).agg(
+        _fin=("interaction", lambda s: (s == "FINISHED").sum()),
+        _app=("interaction", lambda s: (s == "APPLY").sum()),
+        _uc=("interaction", lambda s: (s == "USER_CANCEL").sum()),
+        _sc=("interaction", lambda s: (s == "SYSTEM_CANCEL").sum()),
+    )
+    pairs_hist = pairs_hist.merge(shifts_info[["shift_id", "start_at"]], on="shift_id", how="left")
+    pairs_hist = pairs_hist.sort_values(["user_id", "start_at"]).reset_index(drop=True)
+
+    for col, raw in [("h_fin", "_fin"), ("h_app", "_app"), ("h_uc", "_uc"), ("h_sc", "_sc")]:
+        pairs_hist[col] = pairs_hist.groupby("user_id")[raw].cumsum() - pairs_hist[raw]
+
+    pairs_hist["user_reliability_score"] = (
+        pairs_hist["h_fin"] * INTERACTION_WEIGHTS["FINISHED"]
+        + pairs_hist["h_app"] * INTERACTION_WEIGHTS["APPLY"]
+        + pairs_hist["h_uc"] * INTERACTION_WEIGHTS["USER_CANCEL"]
+        + pairs_hist["h_sc"] * INTERACTION_WEIGHTS["SYSTEM_CANCEL"]
+    )
+
+    df = df.merge(
+        pairs_hist[["user_id", "shift_id", "user_reliability_score"]],
+        on=["user_id", "shift_id"],
+        how="left",
+    )
+    df["user_reliability_score"] = df["user_reliability_score"].fillna(0)
+
+    # 3. user_finished_employer - количество завершенных смен у работодателя
+    fin_emp_cnt = (
+        ev_before[ev_before["interaction"] == "FINISHED"]
+        .groupby(["user_id", "employer_id"])
+        .size()
+        .reset_index(name="user_finished_employer")
+    )
+    df = df.merge(fin_emp_cnt, on=["user_id", "employer_id"], how="left")
+    df["user_finished_employer"] = df["user_finished_employer"].fillna(0).astype(int)
+
+    # 4. user_finished_workplace - количество завершенных смен на точке
+    fin_wp_cnt = (
+        ev_before[ev_before["interaction"] == "FINISHED"]
+        .groupby(["user_id", "workplace_id"])
+        .size()
+        .reset_index(name="user_finished_workplace")
+    )
+    df = df.merge(fin_wp_cnt, on=["user_id", "workplace_id"], how="left")
+    df["user_finished_workplace"] = df["user_finished_workplace"].fillna(0).astype(int)
+
+    # 5. user_task_affinity - аффинити к типу задачи
+    task_affinity = (
+        ev_before[ev_before["interaction"].isin(["APPLY", "FINISHED"])]
+        .groupby(["user_id", "task_type"])
+        .size()
+        .reset_index(name="user_task_affinity")
+    )
+    df = df.merge(task_affinity, on=["user_id", "task_type"], how="left")
+    df["user_task_affinity"] = df["user_task_affinity"].fillna(0).astype(int)
+
+    # 6. reward_delta - отклонение вознаграждения от среднего пользователя
+    user_avg_reward = (
+        ev_before[ev_before["interaction"].isin(["APPLY", "FINISHED"])]
+        .merge(shifts[["id", "reward"]].rename(columns={"id": "shift_id"}), on="shift_id", how="inner")
+        .groupby("user_id")["reward"]
+        .mean()
+        .reset_index(name="user_avg_reward")
+    )
+    df = df.merge(user_avg_reward, on="user_id", how="left")
+    df["reward_delta"] = df["reward"] - df["user_avg_reward"].fillna(df["reward"])
+    df = df.drop(columns=["user_avg_reward"])
+
     return df
 
 
@@ -410,7 +500,7 @@ def run_training(cfg: TrainConfig) -> dict[str, object]:
         iterations=2000,
         learning_rate=0.05,
         depth=6,
-        scale_pos_weight=7,
+        scale_pos_weight=19,
         random_seed=cfg.random_state,
         thread_count=-1,
         early_stopping_rounds=50,
