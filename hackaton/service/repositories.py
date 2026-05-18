@@ -76,7 +76,7 @@ class Repository:
         if not payload:
             return 0
         query = """
-        INSERT OR REPLACE INTO events(id, shift_id, user_id, interaction, ts)
+        INSERT OR IGNORE INTO events(id, shift_id, user_id, interaction, ts)
         VALUES(?, ?, ?, ?, ?)
         """
         async with aiosqlite.connect(self.db_path) as db:

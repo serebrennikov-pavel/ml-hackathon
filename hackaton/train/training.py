@@ -175,7 +175,8 @@ def _load_and_validate_data(
     }
     users = users.dropna(subset=critical["users"]).drop_duplicates(subset=["id"])
     shifts = shifts.dropna(subset=critical["shifts"]).drop_duplicates(subset=["id"])
-    events = events.dropna(subset=critical["events"]).drop_duplicates(subset=["id"])
+    # event.id в train CSV не уникален (один id — много смен); как в ноутбуке — все строки
+    events = events.dropna(subset=critical["events"])
 
     checks["post_clean_rows"] = {
         "user": int(len(users)),
@@ -364,47 +365,63 @@ def _build_training_frame(
     )
     df["user_reliability_score"] = df["user_reliability_score"].fillna(0)
 
+    fin_before = ev_before[ev_before["interaction"] == "FINISHED"]
+
     # 3. user_finished_employer - количество завершенных смен у работодателя
-    fin_emp_cnt = (
-        ev_before[ev_before["interaction"] == "FINISHED"]
-        .groupby(["user_id", "employer_id"])
+    fin_emp = fin_before[["user_id", "employer_id", "start_at"]].rename(columns={"start_at": "fin_at"})
+    emp_cnt = df[["user_id", "shift_id", "employer_id", "start_at"]].merge(fin_emp, on=["user_id", "employer_id"], how="left")
+    emp_cnt = (
+        emp_cnt[emp_cnt["fin_at"] < emp_cnt["start_at"]]
+        .groupby(["user_id", "shift_id"])
         .size()
         .reset_index(name="user_finished_employer")
     )
-    df = df.merge(fin_emp_cnt, on=["user_id", "employer_id"], how="left")
+    df = df.merge(emp_cnt, on=["user_id", "shift_id"], how="left")
     df["user_finished_employer"] = df["user_finished_employer"].fillna(0).astype(int)
 
     # 4. user_finished_workplace - количество завершенных смен на точке
-    fin_wp_cnt = (
-        ev_before[ev_before["interaction"] == "FINISHED"]
-        .groupby(["user_id", "workplace_id"])
+    fin_wp = fin_before[["user_id", "workplace_id", "start_at"]].rename(columns={"start_at": "fin_at"})
+    wp_cnt = df[["user_id", "shift_id", "workplace_id", "start_at"]].merge(fin_wp, on=["user_id", "workplace_id"], how="left")
+    wp_cnt = (
+        wp_cnt[wp_cnt["fin_at"] < wp_cnt["start_at"]]
+        .groupby(["user_id", "shift_id"])
         .size()
         .reset_index(name="user_finished_workplace")
     )
-    df = df.merge(fin_wp_cnt, on=["user_id", "workplace_id"], how="left")
+    df = df.merge(wp_cnt, on=["user_id", "shift_id"], how="left")
     df["user_finished_workplace"] = df["user_finished_workplace"].fillna(0).astype(int)
 
     # 5. user_task_affinity - аффинити к типу задачи
-    task_affinity = (
-        ev_before[ev_before["interaction"].isin(["APPLY", "FINISHED"])]
-        .groupby(["user_id", "task_type"])
-        .size()
-        .reset_index(name="user_task_affinity")
+    task_aff = ev_before[ev_before["interaction"].isin(["APPLY", "FINISHED"])].merge(
+        shifts.rename(columns={"id": "shift_id"})[["shift_id", "task_type", "start_at"]].rename(
+            columns={"start_at": "sh_start", "task_type": "tt"}
+        ),
+        on="shift_id",
+        how="inner",
     )
-    df = df.merge(task_affinity, on=["user_id", "task_type"], how="left")
+    task_aff2 = df[["user_id", "shift_id", "task_type", "start_at"]].merge(
+        task_aff[["user_id", "tt", "sh_start"]], on="user_id", how="left"
+    )
+    task_aff2 = task_aff2[
+        (task_aff2["sh_start"] < task_aff2["start_at"]) & (task_aff2["tt"] == task_aff2["task_type"])
+    ]
+    task_aff_cnt = task_aff2.groupby(["user_id", "shift_id"]).size().reset_index(name="user_task_affinity")
+    df = df.merge(task_aff_cnt, on=["user_id", "shift_id"], how="left")
     df["user_task_affinity"] = df["user_task_affinity"].fillna(0).astype(int)
 
-    # 6. reward_delta - отклонение вознаграждения от среднего пользователя
-    user_avg_reward = (
-        ev_before[ev_before["interaction"].isin(["APPLY", "FINISHED"])]
-        .merge(shifts[["id", "reward"]].rename(columns={"id": "shift_id"}), on="shift_id", how="inner")
-        .groupby("user_id")["reward"]
-        .mean()
-        .reset_index(name="user_avg_reward")
+    # 6. reward_delta - отклонение RPH смены от среднего пользователя по завершённым сменам
+    shift_pay = shifts.rename(columns={"id": "shift_id"})[["shift_id", "reward", "hours", "start_at"]].rename(
+        columns={"start_at": "sh_start", "reward": "fin_reward", "hours": "fin_hours"}
     )
-    df = df.merge(user_avg_reward, on="user_id", how="left")
-    df["reward_delta"] = df["reward"] - df["user_avg_reward"].fillna(df["reward"])
-    df = df.drop(columns=["user_avg_reward"])
+    fin_rph = fin_before[["user_id", "shift_id"]].merge(shift_pay, on="shift_id", how="inner")
+    fin_rph["rph"] = fin_rph["fin_reward"] / fin_rph["fin_hours"].clip(lower=1)
+    rph_check = df[["user_id", "shift_id", "start_at"]].merge(fin_rph[["user_id", "rph", "sh_start"]], on="user_id", how="left")
+    rph_check = rph_check[rph_check["sh_start"] < rph_check["start_at"]]
+    user_avg_rph = rph_check.groupby(["user_id", "shift_id"])["rph"].mean().reset_index(name="user_avg_rph")
+    df = df.merge(user_avg_rph, on=["user_id", "shift_id"], how="left")
+    df["user_avg_rph"] = df["user_avg_rph"].fillna(df["reward_per_hour"].median())
+    df["reward_delta"] = df["reward_per_hour"] - df["user_avg_rph"]
+    df = df.drop(columns=["user_avg_rph"])
 
     return df
 

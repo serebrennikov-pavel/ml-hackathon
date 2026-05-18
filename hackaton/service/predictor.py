@@ -252,27 +252,68 @@ class Predictor:
             task_affinity_rows = await cursor.fetchall()
             task_affinity_dict = {row[0]: row[1] for row in task_affinity_rows}
 
-            # Средняя награда пользователя
-            avg_reward_query = """
-            SELECT e.user_id, AVG(s.reward) as avg_reward
+            # Средний RPH по завершённым сменам (reward_delta в ноутбуке)
+            avg_rph_query = """
+            SELECT e.user_id,
+                   AVG(CAST(s.reward AS REAL) / MAX(s.hours, 1)) AS avg_rph
             FROM events e
             JOIN shifts s ON e.shift_id = s.id
             WHERE e.user_id IN ({})
-              AND e.interaction IN ('APPLY', 'FINISHED')
+              AND e.interaction = 'FINISHED'
               AND s.start_at < ?
+              AND e.ts < s.start_at
             GROUP BY e.user_id
             """.format(",".join("?" * len(candidate_ids)))
-            cursor = await db.execute(avg_reward_query, [*candidate_ids, shift.start_at.isoformat()])
-            avg_reward_rows = await cursor.fetchall()
-            avg_reward_dict = {row[0]: row[1] for row in avg_reward_rows}
+            cursor = await db.execute(avg_rph_query, [*candidate_ids, shift.start_at.isoformat()])
+            avg_rph_dict = {row[0]: row[1] for row in await cursor.fetchall()}
 
-            # Веса для user_reliability_score
-            INTERACTION_WEIGHTS = {
-                "FINISHED": 2.0,
-                "APPLY": 1.0,
-                "USER_CANCEL": -1.5,
-                "SYSTEM_CANCEL": -0.5,
-            }
+            # user_reliability_score: сумма взвешенных событий на сменах до start_at
+            reliability_query = """
+            SELECT e.user_id,
+              SUM(CASE e.interaction
+                WHEN 'FINISHED' THEN 2.0
+                WHEN 'APPLY' THEN 1.0
+                WHEN 'USER_CANCEL' THEN -1.5
+                WHEN 'SYSTEM_CANCEL' THEN -0.5
+                ELSE 0.0 END) AS score
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND s.start_at < ?
+              AND e.ts < s.start_at
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(reliability_query, [*candidate_ids, shift.start_at.isoformat()])
+            reliability_dict = {row[0]: row[1] for row in await cursor.fetchall()}
+
+            # cum_shifts_viewed: число прошлых смен с активностью до их start_at
+            cum_shifts_query = """
+            SELECT e.user_id, COUNT(DISTINCT e.shift_id) AS cnt
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND s.start_at < ?
+              AND e.ts < s.start_at
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(cum_shifts_query, [*candidate_ids, shift.start_at.isoformat()])
+            cum_shifts_dict = {row[0]: row[1] for row in await cursor.fetchall()}
+
+            # worked_long_recently: FINISHED 8+ч, смена началась < 2 суток назад
+            fatigue_query = """
+            SELECT DISTINCT e.user_id
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction = 'FINISHED'
+              AND e.ts < s.start_at
+              AND s.start_at < ?
+              AND (julianday(?) - julianday(s.start_at)) * 86400.0 < 172800
+              AND s.hours >= 8
+            """.format(",".join("?" * len(candidate_ids)))
+            shift_at = shift.start_at.isoformat()
+            cursor = await db.execute(fatigue_query, [*candidate_ids, shift_at, shift_at])
+            fatigue_set = {row[0] for row in await cursor.fetchall()}
 
         # Построение фрейма признаков
         features = []
@@ -281,9 +322,11 @@ class Predictor:
             if user_data is None:
                 continue
 
-            # События текущей смены
+            # События текущей смены (синтетический VIEW, если кандидат без просмотра)
             user_events = events_df[events_df["user_id"] == user_id]
             view_cnt = int((user_events["interaction"] == "VIEW").sum())
+            if view_cnt == 0:
+                view_cnt = 1
 
             # История пользователя
             user_hist = hist_df[hist_df["user_id"] == user_id]
@@ -301,18 +344,16 @@ class Predictor:
                 last_ts = user_events["ts"].max()
                 recency_days = (shift.start_at - last_ts).total_seconds() / 86400
             else:
-                recency_days = 999
+                recency_days = 0.0
 
             # Дней до смены с момента первого просмотра
             first_view = user_events[user_events["interaction"] == "VIEW"]["ts"].min() if len(user_events) > 0 else None
-            days_to_shift = (shift.start_at - first_view).total_seconds() / 86400 if pd.notna(first_view) else 0
+            if pd.notna(first_view):
+                days_to_shift = (shift.start_at - first_view).total_seconds() / 86400
+            else:
+                days_to_shift = 0.0
 
-            # Усталость
-            long_shifts = user_hist[
-                (user_hist["interaction"] == "FINISHED")
-                & ((shift.start_at - user_hist["shift_start"]).dt.total_seconds() < 2 * 86400)
-            ]
-            worked_long_recently = 0  # Упрощение: нужна информация о длительности смен
+            worked_long_recently = int(user_id in fatigue_set)
 
             # Совпадения
             same_location = int(shift.location_id == user_data["user_location_id"])
@@ -336,13 +377,7 @@ class Predictor:
             system_cancel_cnt = sys_cancel_dict.get(user_id, 0)
 
             # 2. user_reliability_score
-            user_hist_system_cancels = int((user_hist["interaction"] == "SYSTEM_CANCEL").sum())
-            user_reliability_score = (
-                user_hist_finished * INTERACTION_WEIGHTS["FINISHED"]
-                + user_hist_applies * INTERACTION_WEIGHTS["APPLY"]
-                + user_hist_cancels * INTERACTION_WEIGHTS["USER_CANCEL"]
-                + user_hist_system_cancels * INTERACTION_WEIGHTS["SYSTEM_CANCEL"]
-            )
+            user_reliability_score = reliability_dict.get(user_id, 0.0)
 
             # 3. user_finished_employer
             user_finished_employer = fin_emp_dict.get(user_id, 0)
@@ -354,8 +389,8 @@ class Predictor:
             user_task_affinity = task_affinity_dict.get(user_id, 0)
 
             # 6. reward_delta
-            user_avg_reward = avg_reward_dict.get(user_id, shift.reward)
-            reward_delta = shift.reward - user_avg_reward
+            user_avg_rph = avg_rph_dict.get(user_id, reward_per_hour)
+            reward_delta = reward_per_hour - user_avg_rph
 
             features.append(
                 {
@@ -375,7 +410,7 @@ class Predictor:
                     "user_apply_rate": user_apply_rate,
                     "user_finish_rate": user_finish_rate,
                     "user_cancel_rate": user_cancel_rate,
-                    "cum_shifts_viewed": user_hist_views,
+                    "cum_shifts_viewed": cum_shifts_dict.get(user_id, 0),
                     "recency_days": max(recency_days, 0),
                     "worked_long_recently": worked_long_recently,
                     "same_location": same_location,

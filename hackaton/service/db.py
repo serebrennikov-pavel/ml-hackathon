@@ -30,11 +30,12 @@ CREATE TABLE IF NOT EXISTS shifts (
 );
 
 CREATE TABLE IF NOT EXISTS events (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
     shift_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     interaction TEXT NOT NULL,
-    ts TEXT NOT NULL
+    ts TEXT NOT NULL,
+    PRIMARY KEY (id, shift_id, user_id, interaction, ts)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_shift_id ON events(shift_id);
