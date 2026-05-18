@@ -26,7 +26,6 @@ def cli() -> None:
 )
 @click.option("--output-dir", type=click.Path(path_type=Path, file_okay=False), required=True)
 @click.option("--random-state", type=int, default=42, show_default=True)
-@click.option("--max-iter", type=int, default=1000, show_default=True)
 @click.option("--test-ratio", type=float, default=0.2, show_default=True)
 @click.option("--skip-shap", is_flag=True, default=False)
 @click.option("--shap-sample-size", type=int, default=1000, show_default=True)
@@ -36,7 +35,6 @@ def train_cmd(
     event_path: Path,
     output_dir: Path,
     random_state: int,
-    max_iter: int,
     test_ratio: float,
     skip_shap: bool,
     shap_sample_size: int,
@@ -52,7 +50,6 @@ def train_cmd(
         event_path=str(event_path),
         output_dir=str(output_dir),
         random_state=random_state,
-        max_iter=max_iter,
         test_ratio=test_ratio,
         skip_shap=skip_shap,
         shap_sample_size=shap_sample_size,

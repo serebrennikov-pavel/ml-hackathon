@@ -37,6 +37,7 @@ class Predictor:
             "worked_long_recently",
             "same_location",
             "mk_ok",
+            "is_strict_location",
             "worked_employer_before",
             "worked_workplace_before",
             "task_match",
@@ -47,6 +48,13 @@ class Predictor:
             "id_differential",
             "has_mk",
             "task_type",
+            # Новые признаки v2
+            "user_reliability_score",
+            "system_cancel_cnt",
+            "user_finished_employer",
+            "user_finished_workplace",
+            "user_task_affinity",
+            "reward_delta",
         ]
 
     def load_model(self) -> None:
@@ -68,13 +76,15 @@ class Predictor:
         async with aiosqlite.connect(db_path) as db:
             # Получаем данные пользователей
             user_query = f"""
-            SELECT id, location_id, has_mk
+            SELECT id, location_id, has_mk, is_strict_location
             FROM users
             WHERE id IN ({','.join('?' * len(candidate_ids))})
             """
             cursor = await db.execute(user_query, candidate_ids)
             user_rows = await cursor.fetchall()
-            users_df = pd.DataFrame(user_rows, columns=["user_id", "user_location_id", "has_mk"])
+            users_df = pd.DataFrame(
+                user_rows, columns=["user_id", "user_location_id", "has_mk", "is_strict_location"]
+            )
 
             # Получаем события до start_at смены
             event_query = """
@@ -173,6 +183,138 @@ class Predictor:
             fill_row = await cursor.fetchone()
             n_applied = fill_row[0] if fill_row else 0
 
+            # === НОВЫЕ ПРИЗНАКИ V2 ===
+
+            # Количество системных отмен для каждого пользователя
+            sys_cancel_query = """
+            SELECT user_id, COUNT(*) as cnt
+            FROM events
+            WHERE user_id IN ({})
+              AND shift_id = ?
+              AND interaction = 'SYSTEM_CANCEL'
+              AND ts < ?
+            GROUP BY user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(
+                sys_cancel_query, [*candidate_ids, shift.id, shift.start_at.isoformat()]
+            )
+            sys_cancel_rows = await cursor.fetchall()
+            sys_cancel_dict = {row[0]: row[1] for row in sys_cancel_rows}
+
+            # Количество завершенных смен у работодателя
+            fin_emp_query = """
+            SELECT e.user_id, COUNT(*) as cnt
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction = 'FINISHED'
+              AND s.employer_id = ?
+              AND s.start_at < ?
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(
+                fin_emp_query, [*candidate_ids, shift.employer_id, shift.start_at.isoformat()]
+            )
+            fin_emp_rows = await cursor.fetchall()
+            fin_emp_dict = {row[0]: row[1] for row in fin_emp_rows}
+
+            # Количество завершенных смен на точке
+            fin_wp_query = """
+            SELECT e.user_id, COUNT(*) as cnt
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction = 'FINISHED'
+              AND s.workplace_id = ?
+              AND s.start_at < ?
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(
+                fin_wp_query, [*candidate_ids, shift.workplace_id, shift.start_at.isoformat()]
+            )
+            fin_wp_rows = await cursor.fetchall()
+            fin_wp_dict = {row[0]: row[1] for row in fin_wp_rows}
+
+            # Аффинити к типу задачи
+            task_affinity_query = """
+            SELECT e.user_id, COUNT(*) as cnt
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction IN ('APPLY', 'FINISHED')
+              AND s.task_type = ?
+              AND s.start_at < ?
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(
+                task_affinity_query, [*candidate_ids, shift.task_type, shift.start_at.isoformat()]
+            )
+            task_affinity_rows = await cursor.fetchall()
+            task_affinity_dict = {row[0]: row[1] for row in task_affinity_rows}
+
+            # Средний RPH по завершённым сменам (reward_delta в ноутбуке)
+            avg_rph_query = """
+            SELECT e.user_id,
+                   AVG(CAST(s.reward AS REAL) / MAX(s.hours, 1)) AS avg_rph
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction = 'FINISHED'
+              AND s.start_at < ?
+              AND e.ts < s.start_at
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(avg_rph_query, [*candidate_ids, shift.start_at.isoformat()])
+            avg_rph_dict = {row[0]: row[1] for row in await cursor.fetchall()}
+
+            # user_reliability_score: сумма взвешенных событий на сменах до start_at
+            reliability_query = """
+            SELECT e.user_id,
+              SUM(CASE e.interaction
+                WHEN 'FINISHED' THEN 2.0
+                WHEN 'APPLY' THEN 1.0
+                WHEN 'USER_CANCEL' THEN -1.5
+                WHEN 'SYSTEM_CANCEL' THEN -0.5
+                ELSE 0.0 END) AS score
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND s.start_at < ?
+              AND e.ts < s.start_at
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(reliability_query, [*candidate_ids, shift.start_at.isoformat()])
+            reliability_dict = {row[0]: row[1] for row in await cursor.fetchall()}
+
+            # cum_shifts_viewed: число прошлых смен с активностью до их start_at
+            cum_shifts_query = """
+            SELECT e.user_id, COUNT(DISTINCT e.shift_id) AS cnt
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND s.start_at < ?
+              AND e.ts < s.start_at
+            GROUP BY e.user_id
+            """.format(",".join("?" * len(candidate_ids)))
+            cursor = await db.execute(cum_shifts_query, [*candidate_ids, shift.start_at.isoformat()])
+            cum_shifts_dict = {row[0]: row[1] for row in await cursor.fetchall()}
+
+            # worked_long_recently: FINISHED 8+ч, смена началась < 2 суток назад
+            fatigue_query = """
+            SELECT DISTINCT e.user_id
+            FROM events e
+            JOIN shifts s ON e.shift_id = s.id
+            WHERE e.user_id IN ({})
+              AND e.interaction = 'FINISHED'
+              AND e.ts < s.start_at
+              AND s.start_at < ?
+              AND (julianday(?) - julianday(s.start_at)) * 86400.0 < 172800
+              AND s.hours >= 8
+            """.format(",".join("?" * len(candidate_ids)))
+            shift_at = shift.start_at.isoformat()
+            cursor = await db.execute(fatigue_query, [*candidate_ids, shift_at, shift_at])
+            fatigue_set = {row[0] for row in await cursor.fetchall()}
+
         # Построение фрейма признаков
         features = []
         for user_id in candidate_ids:
@@ -180,9 +322,11 @@ class Predictor:
             if user_data is None:
                 continue
 
-            # События текущей смены
+            # События текущей смены (синтетический VIEW, если кандидат без просмотра)
             user_events = events_df[events_df["user_id"] == user_id]
             view_cnt = int((user_events["interaction"] == "VIEW").sum())
+            if view_cnt == 0:
+                view_cnt = 1
 
             # История пользователя
             user_hist = hist_df[hist_df["user_id"] == user_id]
@@ -200,22 +344,21 @@ class Predictor:
                 last_ts = user_events["ts"].max()
                 recency_days = (shift.start_at - last_ts).total_seconds() / 86400
             else:
-                recency_days = 999
+                recency_days = 0.0
 
             # Дней до смены с момента первого просмотра
             first_view = user_events[user_events["interaction"] == "VIEW"]["ts"].min() if len(user_events) > 0 else None
-            days_to_shift = (shift.start_at - first_view).total_seconds() / 86400 if pd.notna(first_view) else 0
+            if pd.notna(first_view):
+                days_to_shift = (shift.start_at - first_view).total_seconds() / 86400
+            else:
+                days_to_shift = 0.0
 
-            # Усталость
-            long_shifts = user_hist[
-                (user_hist["interaction"] == "FINISHED")
-                & ((shift.start_at - user_hist["shift_start"]).dt.total_seconds() < 2 * 86400)
-            ]
-            worked_long_recently = 0  # Упрощение: нужна информация о длительности смен
+            worked_long_recently = int(user_id in fatigue_set)
 
             # Совпадения
             same_location = int(shift.location_id == user_data["user_location_id"])
             mk_ok = int(user_data["has_mk"] >= shift.need_mk)
+            is_strict_location = float(user_data["is_strict_location"])
             worked_employer_before = int(user_id in worked_emp)
             worked_workplace_before = int(user_id in worked_wp)
             task_match = int(fav_tasks_dict.get(user_id) == shift.task_type)
@@ -227,6 +370,27 @@ class Predictor:
             is_holiday = int((shift.start_at.month, shift.start_at.day) in NEW_YEAR_HOLIDAYS)
 
             fill_rate = min(n_applied / max(shift.capacity, 1), 5)
+
+            # === НОВЫЕ ПРИЗНАКИ V2 ===
+
+            # 1. system_cancel_cnt
+            system_cancel_cnt = sys_cancel_dict.get(user_id, 0)
+
+            # 2. user_reliability_score
+            user_reliability_score = reliability_dict.get(user_id, 0.0)
+
+            # 3. user_finished_employer
+            user_finished_employer = fin_emp_dict.get(user_id, 0)
+
+            # 4. user_finished_workplace
+            user_finished_workplace = fin_wp_dict.get(user_id, 0)
+
+            # 5. user_task_affinity
+            user_task_affinity = task_affinity_dict.get(user_id, 0)
+
+            # 6. reward_delta
+            user_avg_rph = avg_rph_dict.get(user_id, reward_per_hour)
+            reward_delta = reward_per_hour - user_avg_rph
 
             features.append(
                 {
@@ -246,11 +410,12 @@ class Predictor:
                     "user_apply_rate": user_apply_rate,
                     "user_finish_rate": user_finish_rate,
                     "user_cancel_rate": user_cancel_rate,
-                    "cum_shifts_viewed": user_hist_views,
+                    "cum_shifts_viewed": cum_shifts_dict.get(user_id, 0),
                     "recency_days": max(recency_days, 0),
                     "worked_long_recently": worked_long_recently,
                     "same_location": same_location,
                     "mk_ok": mk_ok,
+                    "is_strict_location": is_strict_location,
                     "worked_employer_before": worked_employer_before,
                     "worked_workplace_before": worked_workplace_before,
                     "task_match": task_match,
@@ -261,6 +426,13 @@ class Predictor:
                     "id_differential": float(shift.id_differential),
                     "has_mk": float(user_data["has_mk"]),
                     "task_type": shift.task_type,
+                    # Новые признаки v2
+                    "user_reliability_score": user_reliability_score,
+                    "system_cancel_cnt": system_cancel_cnt,
+                    "user_finished_employer": user_finished_employer,
+                    "user_finished_workplace": user_finished_workplace,
+                    "user_task_affinity": user_task_affinity,
+                    "reward_delta": reward_delta,
                 }
             )
 

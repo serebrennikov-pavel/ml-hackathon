@@ -22,7 +22,12 @@ LOGGER = logging.getLogger(__name__)
 
 
 class HackatonRpcService:
-    def __init__(self, repository: Repository, prepare: PrepareManager, predictor: Predictor) -> None:
+    def __init__(
+        self,
+        repository: Repository,
+        prepare: PrepareManager,
+        predictor: Predictor,
+    ) -> None:
         self.repository = repository
         self.prepare_manager = prepare
         self.predictor = predictor

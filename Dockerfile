@@ -13,6 +13,7 @@ COPY pyproject.toml poetry.lock README.md /app/
 RUN poetry install --only main --no-root --no-ansi
 
 COPY . /app
+RUN test -f artifacts/train/model.pkl
 
 EXPOSE 8000
 

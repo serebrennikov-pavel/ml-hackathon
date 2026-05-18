@@ -218,9 +218,15 @@ __marimo__/
 /local/
 stage3_data_prep.ipynb
 ranking.ipynb
-artifacts/
+artifacts/*
+!artifacts/train/
+artifacts/train/*
+!artifacts/train/model.pkl
+!artifacts/train/metrics.json
+!artifacts/train/feature_schema.json
 data/
 .DS_Store
 settings.json
 implementation/
 tmp_eval_sample/
+catboost_info/
